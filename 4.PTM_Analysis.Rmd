@@ -1,0 +1,306 @@
+---
+title: "Jaccard Index for PTMs"
+author: "Adam Martí García"
+date: "2024-11-16"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+Load necessary libraries and file paths. 
+```{R}
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(stringr)
+library(pheatmap)
+
+setwd("~/Desktop/PGB/PGB_FINAL_PROJECT")
+ptm_data <- read.csv("~/Desktop/PGB/PGB_FINAL_PROJECT/PTMs_Atoh1.csv", stringsAsFactors = FALSE) #This is a file that contains all the different PTMs by position for each of the paralogous genes, and also if they are or not on the bHLH domain.
+ptm_length <- read.csv("~/Desktop/PGB/PGB_FINAL_PROJECT/PTMs_gene_lenghts.csv") #This is a file that contains the different protein lengths encoded by each of the paralogous genes. 
+head(ptm_data)
+head(ptm_length)
+```
+
+Define the function for splitting the residue modification. For how is the .csv document, we need to split into different columns the modification type and the position.
+```{R}
+# Function to parse the modification string
+parse_modification <- function(modification) {
+  print(paste("Processing:", modification)) # Debugging print statement
+  
+  # Ensure the input is a single string and trim spaces
+  modification <- trimws(as.character(modification))
+  
+  if (is.na(modification) || modification == "") {
+    return(list(Residue = NA, Position = NA, Modification = NA))
+  }
+  
+  # Extract the residue (first character)
+  residue <- str_sub(modification, 1, 1)
+  
+  # Extract the position (numbers)
+  position <- str_extract(modification, "\\d+")
+  
+  # Extract the modification type (if present)
+  mod_type <- str_extract(modification, "-[a-z]+$")
+  
+  # Return a list with extracted components
+  return(list(
+    Residue = residue,
+    Position = as.numeric(position),
+    Modification = mod_type
+  ))
+}
+```
+
+Next, we apply the function to the data
+
+```{R}
+
+# Confirm the column name
+corrected_column <- "Modification"  # Adjust based on your actual column name
+
+# Check if the column exists and contains data
+print("Initial data in the Modification column:")
+print(head(ptm_data[[corrected_column]]))
+
+# Apply the parse_modification function row-wise
+ptm_data_parsed <- ptm_data %>%
+  mutate(parsed_info = map(!!sym(corrected_column), parse_modification)) %>%
+  unnest_wider(parsed_info, names_sep = "_") 
+
+# Display the resulting data frame after parsing
+print("Data after applying parse_modification and unnest_wider:")
+print(head(ptm_data_parsed))
+
+# Remove any extra unwanted columns
+# Explicitly select only the columns you need
+ptm_data_parsed <- ptm_data_parsed %>%
+  dplyr::select(Gene, Modification, bHLH, parsed_info_Residue, parsed_info_Position, parsed_info_Modification)
+
+# Print the final result
+print("Final data:")
+print(ptm_data_parsed)
+
+```
+
+Next, positions of each of the modifications must be normalized, because all the different proteins have different lengths, and a modification on position 54 of NEUROD2 is not the same that for NEUROG1. Thus, positions are normalized by percentile (this is, the new position will be presented as positionof PTM/length of the protein).
+```{R}
+# Check the contents of the lengths data
+print(ptm_length)
+
+# Ensure the column names are correctly identified
+lengths_data <- ptm_length %>%
+  rename(Gene = GENE, Length = LENGTH)
+
+# Merge lengths data with the parsed modifications data
+ptm_data_parsed <- ptm_data_parsed %>%
+  left_join(lengths_data, by = "Gene")
+
+# Normalize the modification positions
+ptm_data_parsed <- ptm_data_parsed %>%
+  mutate(Normalized_Position = (parsed_info_Position / Length) * 100)
+
+# Display the resulting data frame with normalized positions
+print(ptm_data_parsed)
+```
+
+Now we are going to try it by separating the modifications in bHLH and the ones that are not, trying thus to capture the possible different level of conservation between a pretty-well structured region on the proteins and the rest of the sequences. Also, we only focus on S and T modifications
+```{R}
+# Filter modifications for Serine (S) and Threonine (T) with bHLH == "No"
+ptm_data_non_bHLH_ST <- ptm_data_parsed %>%
+  filter(parsed_info_Residue %in% c("S", "T"), bHLH == "No")
+
+# Filter modifications for Serine (S) and Threonine (T) with bHLH == "Yes"
+ptm_data_bHLH_ST <- ptm_data_parsed %>%
+  filter(parsed_info_Residue %in% c("S", "T"), bHLH == "Yes")
+
+# Display the results to confirm
+print("Non-bHLH domain modifications for S and T:")
+print(ptm_data_non_bHLH_ST)
+
+print("bHLH domain modifications for S and T:")
+print(ptm_data_bHLH_ST)
+
+# Save the filtered datasets to CSV files
+write.csv(ptm_data_non_bHLH_ST, "non_bHLH_modifications_ST.csv", row.names = FALSE)
+write.csv(ptm_data_bHLH_ST, "bHLH_modifications_ST.csv", row.names = FALSE)
+```
+
+Once positions are normalized and we have only S and T modifications, to compare the differences of distribution of the several PTMs for each protein, we perform Jaccard Index across all the genes of the dataset. However, given that each of the PTM modifications has differential effects on the protein activity (i.e, it is not the same an ubiquitinilation that a phosphorylation), with the goal of trying to be more accurate on the analysis, PTMs are filtered so that analysis is only performed against Serine and Threonine phosporylation PTMs, given that this modification on this both residues has in fact a similar effect. 
+
+In addition, Jaccard Index is performed with a slight window of 5%, because otherwise it is almost impossible to find a PTM modification on the exact percentile. Also, for each pariwise comparisons, average lengths is calculated (we need to take on account both lengths for obtaining the same window size for Gene1-Gene2 comparison and Gene2-Gene1 comparison). 
+
+
+```{R}
+calculate_jaccard_with_window <- function(vec1, vec2, length1, length2, window_percent = 5) {
+  # Calculate the average protein length for window size calculation
+  avg_length <- (length1 + length2) / 2
+  
+  # Calculate the window size based on the average protein length
+  window_size <- (window_percent / 100) * avg_length
+  
+  # Create a set to keep track of unique matches
+  unique_matches <- c()
+  
+  # Calculate matches from vec1 to vec2 and add unique matches
+  matched_from_vec1 <- sapply(vec1, function(pos1) {
+    matched <- which(abs(vec2 - pos1) <= window_size)
+    if (length(matched) > 0) {
+      unique_matches <<- unique(c(unique_matches, matched))  # Store unique matches
+    }
+    return(length(matched) > 0)
+  })
+  
+  # Calculate matches from vec2 to vec1 and add unique matches
+  matched_from_vec2 <- sapply(vec2, function(pos2) {
+    matched <- which(abs(vec1 - pos2) <= window_size)
+    if (length(matched) > 0) {
+      unique_matches <<- unique(c(unique_matches, matched))  # Store unique matches
+    }
+    return(length(matched) > 0)
+  })
+  
+  # Count the number of unique matches as the intersection length
+  intersect_len <- length(unique_matches)
+  
+  # Calculate the union
+  union_len <- length(unique(c(vec1, vec2)))
+  
+  # Avoid division by zero
+  if (union_len == 0) return(NA)
+  
+  # Return the Jaccard Index
+  return(intersect_len / union_len)
+}
+
+```
+
+Now we calculate the Jaccard Index for these ones
+```{R}
+# Calculate Jaccard Index for non-bHLH S/T modifications
+unique_genes_non_bHLH <-unique(ptm_data_non_bHLH_ST$Gene)
+jaccard_results_non_bHLH <- expand.grid(Gene1 = unique_genes_non_bHLH, Gene2 = unique_genes_non_bHLH) %>%
+  rowwise() %>%
+  mutate(Jaccard_Index = {
+    positions1 <- ptm_data_non_bHLH_ST %>% filter(Gene == Gene1) %>% pull(Normalized_Position)
+    positions2 <- ptm_data_non_bHLH_ST %>% filter(Gene == Gene2) %>% pull(Normalized_Position)
+    
+    length1 <- lengths_data %>% filter(Gene == Gene1) %>% pull(Length)
+    length2 <- lengths_data %>% filter(Gene == Gene2) %>% pull(Length)
+    
+    if (length(positions1) > 0 && length(positions2) > 0 && length(length1) > 0 && length(length2) > 0) {
+      calculate_jaccard_with_window(positions1, positions2, length1, length2)
+    } else {
+      NA
+    }
+  })
+
+
+# Calculate Jaccard Index for bHLH S/T modifications
+unique_genes_bHLH <- unique(ptm_data_bHLH_ST$Gene)
+
+jaccard_results_bHLH <- expand.grid(Gene1 = unique_genes_bHLH, Gene2 = unique_genes_bHLH) %>%
+  rowwise() %>%
+  mutate(Jaccard_Index = {
+    positions1 <- ptm_data_bHLH_ST %>% filter(Gene == Gene1) %>% pull(Normalized_Position)
+    positions2 <- ptm_data_bHLH_ST %>% filter(Gene == Gene2) %>% pull(Normalized_Position)
+    
+     length1 <- lengths_data %>% filter(Gene == Gene1) %>% pull(Length)
+     length2 <- lengths_data %>% filter(Gene == Gene2) %>% pull(Length)
+    
+     if (length(positions1) > 0 && length(positions2) > 0 && length(length1) > 0 && length(length2) > 0) {
+      avg_length <- (length1 + length2) / 2
+      calculate_jaccard_with_window(positions1, positions2, length1, length2)
+    } else {
+      NA
+    }
+  })
+
+# Step 5: Save the results to CSV files
+write.csv(jaccard_results_non_bHLH, "jaccard_non_bHLH_SerThr_results.csv", row.names = FALSE)
+write.csv(jaccard_results_bHLH, "jaccard_bHLH_SerThr_results.csv", row.names = FALSE)
+```
+
+And we finally display the results
+```{R}
+# Load the updated CSV files
+jaccard_non_bHLH_SerThr <- read.csv("jaccard_non_bHLH_SerThr_results.csv", stringsAsFactors = FALSE)
+jaccard_bHLH_SerThr <- read.csv("jaccard_bHLH_SerThr_results.csv", stringsAsFactors = FALSE)
+
+jaccard_to_matrix <- function(jaccard_df) {
+  # Convert the Jaccard index data frame into a square matrix
+  unique_genes <- unique(c(jaccard_df$Gene1, jaccard_df$Gene2))
+  
+  jaccard_matrix <- matrix(NA, nrow = length(unique_genes), ncol = length(unique_genes),
+                           dimnames = list(unique_genes, unique_genes))
+  
+  for (i in 1:nrow(jaccard_df)) {
+    gene1 <- jaccard_df$Gene1[i]
+    gene2 <- jaccard_df$Gene2[i]
+    value <- jaccard_df$Jaccard_Index[i]
+    jaccard_matrix[gene1, gene2] <- value
+    jaccard_matrix[gene2, gene1] <- value
+  }
+  
+    return(jaccard_matrix)
+}
+
+# Convert to matrices
+non_bHLH_SerThr_matrix <- jaccard_to_matrix(jaccard_non_bHLH_SerThr)
+bHLH_SerThr_matrix <- jaccard_to_matrix(jaccard_bHLH_SerThr)
+
+# Perform clustering
+dist_non_bHLH_SerThr <- dist(non_bHLH_SerThr_matrix)
+clustering_non_bHLH_SerThr <- hclust(dist_non_bHLH_SerThr)
+
+dist_bHLH_SerThr <- dist(bHLH_SerThr_matrix)
+clustering_bHLH_SerThr <- hclust(dist_bHLH_SerThr)
+
+# Plot heatmaps
+pheatmap(
+  non_bHLH_SerThr_matrix,
+  main = "Non-bHLH Jaccard Index (Serine/Threonine)",
+  cluster_rows = clustering_non_bHLH_SerThr,
+  cluster_cols = clustering_non_bHLH_SerThr,
+  color = colorRampPalette(c("white", "darkblue"))(100)
+)
+
+pheatmap(
+  bHLH_SerThr_matrix,
+  main = "bHLH Jaccard Index (Serine/Threonine)",
+  cluster_rows = clustering_bHLH_SerThr,
+  cluster_cols = clustering_bHLH_SerThr,
+  color = colorRampPalette(c("white", "darkblue"))(100)
+)
+```
+
+We can also visualize the clusterings made by the Jaccard Index calculation this way:
+```{R}
+# Plot the dendrogram for non-bHLH Jaccard Index horizontally with adjusted xlim
+# Ensure clustering_non_bHLH_SerThr exists and then create dendrogram_non_bHLH
+dendrogram_non_bHLH <- as.dendrogram(clustering_non_bHLH_SerThr)
+dendrogram_bHLH <- as.dendrogram(clustering_bHLH_SerThr)
+# Adjust font size and margins
+par(cex = 0.8, mar = c(5, 4, 4, 12))  # Increase label size and adjust right margin
+
+# Plot the dendrogram for non-bHLH Jaccard Index with adjusted branch lengths
+plot(
+  dendrogram_non_bHLH,
+  main = "Non-bHLH Clustering Tree (Serine/Threonine)",
+  xlab = "Height",
+  horiz = TRUE,
+)
+
+# Adjust font size and margins for bHLH dendrogram
+par(cex = 0.8, mar = c(5, 4, 4, 12))  # Increase label size and adjust right margin
+
+# Plot the dendrogram for bHLH Jaccard Index with adjusted branch lengths
+plot(
+  dendrogram_bHLH,
+  main = "bHLH Clustering Tree (Serine/Threonine)",
+  xlab = "Height",
+  horiz = TRUE,
+)
+
+```
