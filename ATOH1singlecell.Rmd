@@ -1,0 +1,271 @@
+---
+title: "Single Cell ATOH1"
+author: "Liam McBride"
+date: "2024-11-13"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(stringr)
+library(readr)
+library(ggplot2)
+```
+
+# LOADING IN THE DATA
+```{r}
+FACS_files = list.files("FACS_PROJECT/", full.names = TRUE)
+FACS_files
+raw.data.list <- list()
+for (file in FACS_files){
+  raw.data <- read.csv(file, row.names = 1)
+  raw.data <- Matrix(as.matrix(raw.data), sparse = TRUE)
+  raw.data.list <- append(raw.data.list, raw.data)
+}
+raw.data <- do.call(cbind, raw.data.list)
+#raw.data <- raw.data[,-which(duplicated(colnames(raw.data)))]
+
+meta.data <- read.csv("metadata_FACS_PROJECT.csv")
+plates <- str_split(colnames(raw.data),"[.]", simplify = TRUE)[,2]
+
+rownames(meta.data) <- meta.data$plate.barcode
+cell.meta.data <- meta.data[plates,]
+rownames(cell.meta.data) <- colnames(raw.data)
+
+erccs <- grep(pattern = "^ERCC-", x = rownames(x = raw.data), value = TRUE)
+percent.ercc <- Matrix::colSums(raw.data[erccs, ])/Matrix::colSums(raw.data)
+ercc.index <- grep(pattern = "^ERCC-", x = rownames(x = raw.data), value = FALSE)
+raw.data <- raw.data[-ercc.index,]
+```
+
+
+# CREATING SEURAT OBJECT
+```{r}
+singlecell <- CreateSeuratObject(counts = raw.data)
+singlecell <- AddMetaData(object = singlecell, cell.meta.data)
+singlecell <- AddMetaData(object = singlecell, percent.ercc, col.name = "percent.ercc")
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+singlecell[["percent.mt"]] <- PercentageFeatureSet(singlecell, pattern = "^Mt")
+
+```
+
+# SELECTING NFEATURES, NGENES, & %mt
+```{r}
+VlnPlot(singlecell, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+singlecell <- subset(singlecell, subset = nFeature_RNA >500 & nCount_RNA > 50000 & percent.mt < 5)
+
+VlnPlot(singlecell, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+singlecell <- NormalizeData(object = singlecell, scale.factor = 1e4)
+all.genes <- rownames(singlecell)
+singlecell <- ScaleData(singlecell, features = all.genes)
+```
+
+# VISUALIZING VARIANCE VS EXPRESSION
+```{r}
+singlecell <- FindVariableFeatures(object = singlecell)
+#singlecell@assays$RNA@meta.data$var.features
+
+top10 <- head(VariableFeatures(singlecell), 10)
+plot1 <- VariableFeaturePlot(singlecell)
+plot2 <- LabelPoints(plot = plot1, points = top10, repel = TRUE)
+plot1 + plot2
+```
+
+# RUNNING & VISUALIZING PCA
+```{r}
+singlecell <- RunPCA(singlecell, features = VariableFeatures(object = singlecell))
+ElbowPlot(singlecell, ndims = 50)
+
+# Examine and visualize PCA results a few different ways
+print(singlecell[["pca"]], dims = 1:5, nfeatures = 5)
+
+VizDimLoadings(singlecell, dims = 1:2, reduction = "pca")
+
+DimPlot(singlecell, reduction = "pca") + NoLegend()
+
+DimHeatmap(singlecell, dims = 1, cells = 500, balanced = TRUE)
+
+DimHeatmap(singlecell, dims = 1:15, cells = 500, balanced = TRUE)
+```
+
+# IDENTIFYING NEIGHBOR CELLS AND CLUSTERS
+```{r}
+singlecell <- FindNeighbors(singlecell, dims = 1:43)
+singlecell <- FindClusters(singlecell, resolution = 0.5)
+# Look at cluster IDs of the first 5 cells
+head(Idents(singlecell), 5)
+```
+
+# RUNNING UMAP VISUALIZATIONS (tissue, subtissue, all)
+```{r}
+singlecell <- RunUMAP(singlecell, dims = 1:43)
+DimPlot(singlecell, reduction = "umap", group.by = 'tissue')
+DimPlot(singlecell, reduction = "umap", group.by = 'subtissue')
+DimPlot(singlecell, reduction = "umap", label = TRUE)
+```
+
+
+# IDENTIFYING CELL MARKERS FOR ALL CLUSTERS
+```{r}
+### Only if you have time you can calculate markers for al clusters.
+singlecell.markers <- FindAllMarkers(singlecell, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+### Otherwise find what are the markers for cluster 2
+
+cluster2.markers <- FindMarkers(singlecell, ident.1 = 2, min.pct = 0.25)
+```
+
+# ATOH1 EXPRESSION IN ALL CLUSTERS, TOP 10 GENES
+```{r}
+VlnPlot(singlecell, features = "Atoh1")
+VlnPlot(singlecell, features = c("Atoh1"), slot = "counts", log = TRUE)
+
+## exploring for different paralogs of atoh1
+FeaturePlot(singlecell, features = c("Atoh1", "Atoh3", "Neurod1", "Neurod2", "Neurod4", "Neurod6", "Atoh7"))
+
+singlecell.markers %>%
+    group_by(cluster) %>%
+    dplyr::filter(avg_log2FC > 1) %>%
+    slice_head(n = 10) %>%
+    ungroup() -> top10
+DoHeatmap(singlecell, features = top10$gene) + NoLegend()
+
+```
+
+
+
+# ADDING CELL TYPE ANNOTATIONS PROVIDED BY TABULA MURIS
+```{r}
+anno <- read_csv("annotations_FACS_PROJECT.csv")
+singlecell@meta.data$cell <- rownames(singlecell@meta.data)
+meta2 <- singlecell@meta.data %>% left_join(anno[,c(1,3)], by='cell')
+singlecell <- AddMetaData(object = singlecell, metadata = meta2$cell_ontology_class, col.name = "cell_ontology_class")
+singlecell@meta.data$cell_ontology_class[is.na(singlecell@meta.data$cell_ontology_class)] <- "unknown"
+singlecell$cell_ontology_class <-as.factor(singlecell$cell_ontology_class)
+
+DimPlot(singlecell, reduction = "umap", group.by = 'cell_ontology_class')
+
+FeaturePlot(singlecell, features = "Atoh1")
+
+
+```
+
+
+
+## Subsetting Data for Cerebellum
+```{r}
+# Subset based on metadata column (e.g., "subtissue")
+cerebellum_data <- subset(singlecell, subset = subtissue == "Cerebellum")
+DimPlot(cerebellum_data, reduction = "umap")
+# Perform differential expression analysis
+#markers <- FindMarkers(cerebellum_data, ident.1 = "cell_ontology_class")
+cerebellum.markers <- FindAllMarkers(cerebellum_data, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+
+# View top markers
+head(cerebellum.markers)
+
+
+# Normalize and scale the data
+cerebellum_data <- NormalizeData(cerebellum_data)
+cerebellum_data <- ScaleData(cerebellum_data)
+cerebellum_data <- FindVariableFeatures(cerebellum_data)
+
+# Perform clustering
+cerebellum_data <- FindNeighbors(cerebellum_data, dims = 1:10)
+cerebellum_data <- FindClusters(cerebellum_data, resolution = 0.5)
+
+# Re-visualize clusters
+DimPlot(cerebellum_data, reduction = "umap",  group.by = 'cell_ontology_class')
+
+
+# Violin plot of gene expression
+VlnPlot(cerebellum_data, features = c("Atoh1"))
+
+```
+
+
+
+## DOT PLOT FOR GENES FROM CHIPSEQ/RNA
+
+```{r}
+# List of genes to include in the dot plot
+genes_of_interest <- c("Pcsk9", "Hsd11b2", "E2f1", "Mfap4", "Gli2", "Rps21", "Tcf7l2")  # Replace with your genes
+
+# Generate the dot plot
+DotPlot(cerebellum_data, features = genes_of_interest) +
+    scale_color_gradientn(colors = c("blue", "white", "red")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# Create dot plot of top 10 cerebellum genes plus atoh1
+```{r}
+# Calculate average expression for all genes
+average_expression <- rowMeans(GetAssayData(cerebellum_data, assay = "RNA", slot = "data"))
+
+# Sort genes by average expression
+top10_genes <- names(sort(average_expression, decreasing = TRUE))[1:10]
+top10_genes
+# Add "Atoh1" to the list (if it's not already in the top 10)
+genes_to_plot <- unique(c(top10_genes, "Atoh1"))
+
+print(genes_to_plot)  # Check the selected genes
+unique(cerebellum_data@meta.data$seurat_clusters)
+Idents(cerebellum_data) <- "cell_ontology_class"
+# Generate a dot plot for the selected genes
+DotPlot(cerebellum_data, features = genes_to_plot) + 
+  scale_color_gradientn(colors = c("blue", "white", "red")) +
+  RotatedAxis()  # Rotates axis labels for better visibility
+```
+
+## dot plot with top 10 from RNAseq
+```{r}
+# List of genes to include in the dot plot
+genes_of_rna <- c("Pcsk9", "Xist", "Fat2", "Pax9", "Neurod1", "Kdm5d", "Tfap2d", "Eomes", "Barhl1", "Tcf7l2", "Atoh1")  # Replace with your genes
+
+# Generate the dot plot
+DotPlot(cerebellum_data, features = genes_of_rna) +
+    scale_color_gradientn(colors = c("blue", "white", "red")) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+# SUBSETTING FOR COLON CELLS
+
+```{r}
+# Assuming the metadata column "tissue" identifies brain cells
+colon_data <- subset(singlecell, subset = tissue == c("Colon"))
+n_cells_colon <- sum(singlecell@meta.data$tissue == "Colon", na.rm = TRUE)
+print(n_cells_colon)
+# Identify the top 10 most expressed genes in the brain dataset
+top10_genes_colon <- head(VariableFeatures(colon_data), 10)
+top10_genes_colon
+# Add your gene of interest (Atoh1) if it is not already in the top 10
+genes_to_plot_colon <- unique(c(top10_genes_colon, "Atoh1"))
+
+# Create a dot plot for the selected genes
+DotPlot(colon_data, features = genes_to_plot_colon, , group.by = "cell_ontology_class") + 
+  scale_color_gradient(low = "blue", high = "red") + 
+  RotatedAxis()
+
+#DimPlot(cerebellum_data, reduction = "umap", group.by = 'tissue')
+
+DimPlot(colon_data, reduction = "umap",  group.by = 'cell_ontology_class')
+```
+
+# ATOH1 EXPRESSION ACROSS CELL TYPES
+```{r}
+# Create a violin plot for Atoh1 expression across cell types
+VlnPlot(
+  object = singlecell, 
+  features = "Atoh1", 
+  group.by = "cell_ontology_class", 
+  pt.size = 0.5  # Adjust point size for individual cells
+)
+
+```
