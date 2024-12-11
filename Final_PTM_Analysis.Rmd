@@ -115,10 +115,10 @@ ptm_data_bHLH_ST <- ptm_data_parsed %>%
 
 # Display the results to confirm
 print("Non-bHLH domain modifications for S and T:")
-print(head(ptm_data_non_bHLH_ST))
+print(ptm_data_non_bHLH_ST)
 
 print("bHLH domain modifications for S and T:")
-print(head(ptm_data_bHLH_ST))
+print(ptm_data_bHLH_ST)
 
 # Save the filtered datasets to CSV files
 write.csv(ptm_data_non_bHLH_ST, "non_bHLH_modifications_ST.csv", row.names = FALSE)
@@ -168,6 +168,7 @@ calculate_jaccard_with_window <- function(vec1, vec2, length1, length2, window_p
 Now we calculate the Jaccard Index for these ones
 ```{R}
 # Calculate Jaccard Index for non-bHLH S/T modifications
+unique_genes_non_bHLH <-unique(ptm_data_non_bHLH_ST$Gene)
 jaccard_results_non_bHLH <- expand.grid(Gene1 = unique_genes_non_bHLH, Gene2 = unique_genes_non_bHLH) %>%
   rowwise() %>%
   mutate(Jaccard_Index = {
